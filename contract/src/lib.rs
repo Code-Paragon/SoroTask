@@ -51,12 +51,18 @@ impl SoroTaskContract {
         }
 
         // Generate a unique sequential ID
-        let mut counter: u64 = env.storage().persistent().get(&DataKey::Counter).unwrap_or(0);
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Counter)
+            .unwrap_or(0);
         counter += 1;
         env.storage().persistent().set(&DataKey::Counter, &counter);
 
         // Store the task configuration
-        env.storage().persistent().set(&DataKey::Task(counter), &config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Task(counter), &config);
 
         // Emit TaskRegistered event
         env.events().publish(
@@ -79,7 +85,11 @@ impl SoroTaskContract {
     /// Executes a task if its conditions are met.
     pub fn execute(env: Env, task_id: u64) {
         let task_key = DataKey::Task(task_id);
-        let mut config: TaskConfig = env.storage().persistent().get(&task_key).expect("Task not found");
+        let mut config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .expect("Task not found");
 
         let should_execute = match config.resolver {
             Some(ref resolver_address) => {
@@ -149,13 +159,16 @@ mod test {
         // Check event
         let events = env.events().all();
         let last_event = events.last().unwrap();
-        
+
         assert_eq!(last_event.0, contract_id);
-        
+
         let topics = last_event.1.clone();
-        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "TaskRegistered"));
+        assert_eq!(
+            Symbol::from_val(&env, &topics.get(0).unwrap()),
+            Symbol::new(&env, "TaskRegistered")
+        );
         assert_eq!(u64::from_val(&env, &topics.get(1).unwrap()), 1u64);
-        
+
         let data: Address = last_event.2.clone().into_val(&env);
         assert_eq!(data, creator);
     }
@@ -184,7 +197,7 @@ mod test {
 
         let id1 = client.register(&config);
         let id2 = client.register(&config);
-        
+
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
     }
@@ -215,5 +228,3 @@ mod test {
         assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(1))));
     }
 }
-
-
