@@ -1,22 +1,55 @@
-require('dotenv').config();
-const { Server, Keypair } = require('soroban-client');
+import { loadConfig } from "./src/config.js";
+import { createLogger } from "./src/logger.js";
+import { createRpc } from "./src/rpc.js";
+import { loadAccount } from "./src/account.js";
+import { createPoller } from "./src/poller.js";
+import { GasMonitor } from "./src/gasMonitor.js";
+import { MetricsServer } from "./src/metrics.js";
 
 async function main() {
-    console.log("Starting SoroTask Keeper...");
-    
-    // TODO: Initialize Soroban server connection
-    // const server = new Server(process.env.SOROBAN_RPC_URL);
-    
-    // TODO: Load keeper account
-    // const keeper = Keypair.fromSecret(process.env.KEEPER_SECRET);
-    
-    // Polling loop
-    setInterval(async () => {
-        console.log("Checking for due tasks...");
-        // TODO: Query contract for tasks due for execution
-    }, 10000);
+  const config = loadConfig();
+  const logger = createLogger();
+
+  const gasMonitor = new GasMonitor(logger);
+  const metricsServer = new MetricsServer(gasMonitor, logger);
+
+  metricsServer.start();
+
+  logger.info("Starting SoroTask Keeper...");
+  logger.info("Configured network", {
+    networkPassphrase: config.networkPassphrase,
+    rpcUrl: config.rpcUrl,
+  });
+
+  const rpc = await createRpc(config, logger);
+  const keeperAccount = loadAccount(config);
+
+  logger.info("Keeper account loaded", {
+    publicKey: keeperAccount.publicKey(),
+  });
+
+  const poller = createPoller({
+    config,
+    logger,
+    rpc,
+    keeperAccount,
+  });
+
+  poller.start();
+
+  const shutdown = async (signal) => {
+    logger.info(`Received ${signal}. Starting graceful shutdown...`);
+    await poller.stop?.();
+    metricsServer.stop();
+    logger.info("Shutdown complete.");
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-main().catch(err => {
-    console.error("Keeper failed:", err);
+main().catch((err) => {
+  console.error("Fatal Keeper Error:", err);
+  process.exit(1);
 });

@@ -9,6 +9,9 @@ use soroban_sdk::{
 #[repr(u32)]
 pub enum Error {
     InvalidInterval = 1,
+    Unauthorized = 2,
+    InsufficientBalance = 3,
+    NotInitialized = 4,
 }
 
 #[contracttype]
@@ -22,12 +25,14 @@ pub struct TaskConfig {
     pub interval: u64,
     pub last_run: u64,
     pub gas_balance: i128,
+    pub whitelist: Vec<Address>,
 }
 
 #[contracttype]
 pub enum DataKey {
     Task(u64),
     Counter,
+    Token,
 }
 
 pub trait ResolverInterface {
@@ -101,13 +106,22 @@ impl SoroTaskContract {
     /// inconsistent half-updated form. `last_run` is written **after** the
     /// cross-contract call returns, guaranteeing it only reflects completed
     /// executions.
-    pub fn execute(env: Env, task_id: u64) {
+    pub fn execute(env: Env, keeper: Address, task_id: u64) {
+        keeper.require_auth();
         let task_key = DataKey::Task(task_id);
         let mut config: TaskConfig = env
             .storage()
             .persistent()
             .get(&task_key)
             .expect("Task not found");
+
+        if !config.whitelist.is_empty() && !config.whitelist.contains(&keeper) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        if env.ledger().timestamp() < config.last_run + config.interval {
+            return;
+        }
 
         // ── Resolver gate ────────────────────────────────────────────────────
         // When a resolver is present we use try_invoke_contract so that an
@@ -149,6 +163,90 @@ impl SoroTaskContract {
             env.storage().persistent().set(&task_key, &config);
         }
     }
+
+    /// Initializes the contract with a gas token.
+    pub fn init(env: Env, token: Address) {
+        if env.storage().instance().has(&DataKey::Token) {
+            panic!("Already initialized");
+        }
+        env.storage().instance().set(&DataKey::Token, &token);
+    }
+
+    /// Deposits gas tokens to a task's balance.
+    pub fn deposit_gas(env: Env, task_id: u64, from: Address, amount: i128) {
+        from.require_auth();
+
+        let task_key = DataKey::Task(task_id);
+        let mut config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .expect("Task not found");
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+
+        // Transfer tokens to contract
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(&from, &env.current_contract_address(), &amount);
+
+        // Update balance
+        config.gas_balance += amount;
+        env.storage().persistent().set(&task_key, &config);
+
+        // Emit event
+        env.events()
+            .publish((Symbol::new(&env, "GasDeposited"), task_id), (from, amount));
+    }
+
+    /// Withdraws gas tokens from a task's balance.
+    /// Only the task creator can withdraw.
+    pub fn withdraw_gas(env: Env, task_id: u64, amount: i128) {
+        let task_key = DataKey::Task(task_id);
+        let mut config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .expect("Task not found");
+
+        // Ensure only creator can withdraw
+        config.creator.require_auth();
+
+        if config.gas_balance < amount {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+
+        // Transfer tokens back to creator
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &config.creator, &amount);
+
+        // Update balance
+        config.gas_balance -= amount;
+        env.storage().persistent().set(&task_key, &config);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "GasWithdrawn"), task_id),
+            (config.creator.clone(), amount),
+        );
+    }
+
+    /// Returns the global gas token address.
+    pub fn get_token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized")
+    }
 }
 
 // ============================================================================
@@ -159,11 +257,20 @@ impl SoroTaskContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
+        contract, contractimpl,
         testutils::{Address as _, Events, Ledger as _},
         vec, Env, FromVal, IntoVal,
     };
 
-    // ── Mock target ──────────────────────────────────────────────────────────
+    // ── Mock Contracts ───────────────────────────────────────────────────────
+
+    #[contract]
+    pub struct DummyContract;
+
+    #[contractimpl]
+    impl DummyContract {
+        pub fn hello(_env: Env) {}
+    }
 
     /// Minimal target contract with two callable functions.
     #[contract]
@@ -182,8 +289,7 @@ mod tests {
         }
     }
 
-    // ── Resolver contracts (separate sub-modules to avoid generated symbol
-    //   name conflicts when two contracts share a method name) ───────────────
+    // ── Resolver contracts (separate sub-modules) ───────────────────────
 
     /// Resolver that always approves execution.
     mod resolver_true {
@@ -234,6 +340,7 @@ mod tests {
             interval: 3_600,
             last_run: 0,
             gas_balance: 1_000,
+            whitelist: Vec::new(env),
         }
     }
 
@@ -275,9 +382,10 @@ mod tests {
 
         let target = env.register_contract(None, MockTarget);
         let task_id = client.register(&base_config(&env, target));
+        let keeper = Address::generate(&env);
 
         set_timestamp(&env, 12_345);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         let updated = client.get_task(&task_id).unwrap();
         assert_eq!(
@@ -307,11 +415,13 @@ mod tests {
             interval: 60,
             last_run: 0,
             gas_balance: 500,
+            whitelist: Vec::new(&env),
         };
 
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
         set_timestamp(&env, 99_999);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 99_999);
     }
@@ -331,8 +441,9 @@ mod tests {
         };
 
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
         set_timestamp(&env, 55_000);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         assert_eq!(
             client.get_task(&task_id).unwrap().last_run,
@@ -357,8 +468,9 @@ mod tests {
         };
 
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
         set_timestamp(&env, 77_777);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         assert_eq!(
             client.get_task(&task_id).unwrap().last_run,
@@ -374,14 +486,17 @@ mod tests {
         let client = SoroTaskContractClient::new(&env, &id);
 
         let target = env.register_contract(None, MockTarget);
-        let task_id = client.register(&base_config(&env, target));
+        let mut cfg = base_config(&env, target);
+        cfg.interval = 1; // Small interval to allow repeated execution
+        let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
 
         set_timestamp(&env, 1_000);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 1_000);
 
         set_timestamp(&env, 2_000);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(
             client.get_task(&task_id).unwrap().last_run,
             2_000,
@@ -409,6 +524,7 @@ mod tests {
             interval: 3600,
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let task_id = client.register(&config);
@@ -458,6 +574,7 @@ mod tests {
             interval: 3600,
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let id1 = client.register(&config);
@@ -487,9 +604,147 @@ mod tests {
             interval: 0, // Invalid
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let result = client.try_register(&config);
         assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(1))));
+    }
+
+    #[test]
+    fn test_execute_honors_interval() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SoroTaskContract);
+        let client = SoroTaskContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let dummy_id = env.register_contract(None, DummyContract);
+        let target = dummy_id.clone();
+
+        let config = TaskConfig {
+            creator: creator.clone(),
+            target: target.clone(),
+            function: Symbol::new(&env, "hello"),
+            args: Vec::new(&env),
+            resolver: None,
+            interval: 100,
+            last_run: 0,
+            gas_balance: 1000,
+            whitelist: Vec::new(&env),
+        };
+
+        let task_id = client.register(&config);
+        let keeper = Address::generate(&env);
+
+        // First execution (ledger 50, last_run 0, interval 100)
+        // 50 < 0 + 100 -> returns early
+        env.ledger().set_timestamp(50);
+        client.execute(&keeper, &task_id);
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 0);
+
+        env.ledger().set_timestamp(150);
+        client.execute(&keeper, &task_id);
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 150);
+
+        // Next execution too soon
+        env.ledger().set_timestamp(200);
+        client.execute(&keeper, &task_id);
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 150);
+    }
+
+    #[test]
+    fn test_gas_management_lifecycle() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_id.address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+
+        client.init(&token_address);
+
+        let target = env.register_contract(None, MockTarget);
+        let mut cfg = base_config(&env, target);
+        cfg.gas_balance = 0;
+        let creator = cfg.creator.clone();
+        let task_id = client.register(&cfg);
+
+        // Mint tokens to creator
+        token_admin_client.mint(&creator, &5000);
+        assert_eq!(token_client.balance(&creator), 5000);
+
+        // Deposit gas
+        client.deposit_gas(&task_id, &creator, &2000);
+        assert_eq!(client.get_task(&task_id).unwrap().gas_balance, 2000);
+        assert_eq!(token_client.balance(&creator), 3000);
+        assert_eq!(token_client.balance(&id), 2000);
+
+        // Withdraw gas
+        client.withdraw_gas(&task_id, &500);
+        assert_eq!(client.get_task(&task_id).unwrap().gas_balance, 1500);
+        assert_eq!(token_client.balance(&creator), 3500);
+    }
+
+    #[test]
+    fn test_withdraw_gas_insufficient_balance() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env));
+        let token_address = token_id.address();
+        client.init(&token_address);
+
+        let target = env.register_contract(None, MockTarget);
+        let mut cfg = base_config(&env, target);
+        cfg.gas_balance = 1000;
+        let task_id = client.register(&cfg);
+
+        let result = client.try_withdraw_gas(&task_id, &1500);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::InsufficientBalance as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_execute_fails_if_keeper_not_whitelisted() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let target = env.register_contract(None, MockTarget);
+        let allowed_keeper = Address::generate(&env);
+        let unauthorized_keeper = Address::generate(&env);
+
+        let mut config = base_config(&env, target);
+        config.whitelist = vec![&env, allowed_keeper.clone()];
+        let task_id = client.register(&config);
+
+        set_timestamp(&env, 12_345);
+        let result = client.try_execute(&unauthorized_keeper, &task_id);
+        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(2))));
+    }
+
+    #[test]
+    fn test_execute_succeeds_with_whitelisted_keeper() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let target = env.register_contract(None, MockTarget);
+        let allowed_keeper = Address::generate(&env);
+
+        let mut config = base_config(&env, target);
+        config.whitelist = vec![&env, allowed_keeper.clone()];
+        let task_id = client.register(&config);
+
+        set_timestamp(&env, 12_345);
+        client.execute(&allowed_keeper, &task_id);
+
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 12_345);
     }
 }
