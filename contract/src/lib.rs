@@ -25,6 +25,7 @@ pub struct TaskConfig {
     pub interval: u64,
     pub last_run: u64,
     pub gas_balance: i128,
+    pub whitelist: Vec<Address>,
 }
 
 #[contracttype]
@@ -105,13 +106,18 @@ impl SoroTaskContract {
     /// inconsistent half-updated form. `last_run` is written **after** the
     /// cross-contract call returns, guaranteeing it only reflects completed
     /// executions.
-    pub fn execute(env: Env, task_id: u64) {
+    pub fn execute(env: Env, keeper: Address, task_id: u64) {
+        keeper.require_auth();
         let task_key = DataKey::Task(task_id);
         let mut config: TaskConfig = env
             .storage()
             .persistent()
             .get(&task_key)
             .expect("Task not found");
+
+        if !config.whitelist.is_empty() && !config.whitelist.contains(&keeper) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
 
         if env.ledger().timestamp() < config.last_run + config.interval {
             return;
@@ -334,6 +340,7 @@ mod tests {
             interval: 3_600,
             last_run: 0,
             gas_balance: 1_000,
+            whitelist: Vec::new(env),
         }
     }
 
@@ -375,9 +382,10 @@ mod tests {
 
         let target = env.register_contract(None, MockTarget);
         let task_id = client.register(&base_config(&env, target));
+        let keeper = Address::generate(&env);
 
         set_timestamp(&env, 12_345);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         let updated = client.get_task(&task_id).unwrap();
         assert_eq!(
@@ -407,11 +415,13 @@ mod tests {
             interval: 60,
             last_run: 0,
             gas_balance: 500,
+            whitelist: Vec::new(&env),
         };
 
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
         set_timestamp(&env, 99_999);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 99_999);
     }
@@ -431,8 +441,9 @@ mod tests {
         };
 
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
         set_timestamp(&env, 55_000);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         assert_eq!(
             client.get_task(&task_id).unwrap().last_run,
@@ -457,8 +468,9 @@ mod tests {
         };
 
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
         set_timestamp(&env, 77_777);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
 
         assert_eq!(
             client.get_task(&task_id).unwrap().last_run,
@@ -477,13 +489,14 @@ mod tests {
         let mut cfg = base_config(&env, target);
         cfg.interval = 1; // Small interval to allow repeated execution
         let task_id = client.register(&cfg);
+        let keeper = Address::generate(&env);
 
         set_timestamp(&env, 1_000);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 1_000);
 
         set_timestamp(&env, 2_000);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(
             client.get_task(&task_id).unwrap().last_run,
             2_000,
@@ -511,6 +524,7 @@ mod tests {
             interval: 3600,
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let task_id = client.register(&config);
@@ -560,6 +574,7 @@ mod tests {
             interval: 3600,
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let id1 = client.register(&config);
@@ -589,6 +604,7 @@ mod tests {
             interval: 0, // Invalid
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let result = client.try_register(&config);
@@ -616,23 +632,25 @@ mod tests {
             interval: 100,
             last_run: 0,
             gas_balance: 1000,
+            whitelist: Vec::new(&env),
         };
 
         let task_id = client.register(&config);
+        let keeper = Address::generate(&env);
 
         // First execution (ledger 50, last_run 0, interval 100)
         // 50 < 0 + 100 -> returns early
         env.ledger().set_timestamp(50);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 0);
 
         env.ledger().set_timestamp(150);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 150);
 
         // Next execution too soon
         env.ledger().set_timestamp(200);
-        client.execute(&task_id);
+        client.execute(&keeper, &task_id);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 150);
     }
 
@@ -692,5 +710,38 @@ mod tests {
                 Error::InsufficientBalance as u32
             )))
         );
+    fn test_execute_fails_if_keeper_not_whitelisted() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let target = env.register_contract(None, MockTarget);
+        let allowed_keeper = Address::generate(&env);
+        let unauthorized_keeper = Address::generate(&env);
+
+        let mut config = base_config(&env, target);
+        config.whitelist = vec![&env, allowed_keeper.clone()];
+        let task_id = client.register(&config);
+
+        set_timestamp(&env, 12_345);
+        let result = client.try_execute(&unauthorized_keeper, &task_id);
+        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(2))));
+    }
+
+    #[test]
+    fn test_execute_succeeds_with_whitelisted_keeper() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let target = env.register_contract(None, MockTarget);
+        let allowed_keeper = Address::generate(&env);
+
+        let mut config = base_config(&env, target);
+        config.whitelist = vec![&env, allowed_keeper.clone()];
+        let task_id = client.register(&config);
+
+        set_timestamp(&env, 12_345);
+        client.execute(&allowed_keeper, &task_id);
+
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 12_345);
     }
 }
