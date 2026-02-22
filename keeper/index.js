@@ -1,79 +1,55 @@
-require('dotenv').config();
-const { Server, Keypair } = require('soroban-client');
-const ExecutionQueue = require('./src/queue');
-const GasMonitor = require('./src/gasMonitor');
-const MetricsServer = require('./src/metrics');
+import { loadConfig } from "./src/config.js";
+import { createLogger } from "./src/logger.js";
+import { createRpc } from "./src/rpc.js";
+import { loadAccount } from "./src/account.js";
+import { createPoller } from "./src/poller.js";
+import { GasMonitor } from "./src/gasMonitor.js";
+import { MetricsServer } from "./src/metrics.js";
 
 async function main() {
-    console.log("Starting SoroTask Keeper...");
-    
-    // Initialize gas monitor
-    const gasMonitor = new GasMonitor();
-    
-    // Initialize metrics server
-    const metricsServer = new MetricsServer(gasMonitor);
-    await metricsServer.start();
-    
-    // TODO: Initialize Soroban server connection
-    // const server = new Server(process.env.SOROBAN_RPC_URL);
-    
-    // TODO: Load keeper account
-    // const keeper = Keypair.fromSecret(process.env.KEEPER_SECRET);
-    
-    const queue = new ExecutionQueue();
-const config = require('./src/config');
-const { server } = require('./src/rpc');
-const { Keypair } = require('@stellar/stellar-sdk');
+  const config = loadConfig();
+  const logger = createLogger();
 
-async function main() {
-    console.log("Starting SoroTask Keeper...");
-    console.log(`Configured for network: ${config.networkPassphrase}`);
-    console.log(`RPC URL: ${config.rpcUrl}`);
+  const gasMonitor = new GasMonitor(logger);
+  const metricsServer = new MetricsServer(gasMonitor, logger);
 
-    try {
-        // Connection validation / Startup health check
-        const networkInfo = await server.getNetwork();
-        console.log("Successfully connected to Soroban RPC!");
-        console.log("Network Passphrase from RPC:", networkInfo.passphrase);
+  metricsServer.start();
 
-    // Dummy executor function for now
-    const dummyExecutor = async (taskId) => {
-        // In a real implementation, this would check the actual gas balance from the contract
-        // For now, simulate with a random gas balance
-        const simulatedGasBalance = Math.floor(Math.random() * 1000); // Random balance between 0-999
-        
-        // Check gas balance and decide whether to proceed
-        const shouldSkip = await gasMonitor.checkGasBalance(taskId, simulatedGasBalance);
-        
-        if (shouldSkip) {
-            console.log(`Skipping execution for task ${taskId} due to insufficient gas balance.`);
-            return;
-        }
-        
-        return new Promise((resolve) => setTimeout(resolve, 500));
-    };
-        if (networkInfo.passphrase !== config.networkPassphrase) {
-            throw new Error(`Network passphrase mismatch! Expected: ${config.networkPassphrase}, Got: ${networkInfo.passphrase}`);
-        }
-    } catch (err) {
-        console.error("Failed to connect to Soroban RPC or network mismatch:", err.message);
-        process.exit(1);
-    }
+  logger.info("Starting SoroTask Keeper...");
+  logger.info("Configured network", {
+    networkPassphrase: config.networkPassphrase,
+    rpcUrl: config.rpcUrl,
+  });
 
-    // Load keeper account
-    const keeper = Keypair.fromSecret(config.keeperSecret);
-    console.log(`Keeper Account: ${keeper.publicKey()}`);
+  const rpc = await createRpc(config, logger);
+  const keeperAccount = loadAccount(config);
 
-    // Polling loop
-    const pollingInterval = setInterval(async () => {
-        console.log("Checking for due tasks...");
-        // TODO: Query contract for tasks due for execution
-    }, config.pollingIntervalMs);
+  logger.info("Keeper account loaded", {
+    publicKey: keeperAccount.publicKey(),
+  });
+
+  const poller = createPoller({
+    config,
+    logger,
+    rpc,
+    keeperAccount,
+  });
+
+  poller.start();
+
+  const shutdown = async (signal) => {
+    logger.info(`Received ${signal}. Starting graceful shutdown...`);
+    await poller.stop?.();
+    metricsServer.stop();
+    logger.info("Shutdown complete.");
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-main().catch(err => {
-    console.error("Keeper failed:", err);
-});
-    console.error("Keeper initialization failed:", err);
-    process.exit(1);
+main().catch((err) => {
+  console.error("Fatal Keeper Error:", err);
+  process.exit(1);
 });
